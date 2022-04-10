@@ -3,45 +3,141 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"flag"
 	"sync"
 	"time"
 
+	"food/config"
 	"food/dd"
 	"food/logger"
 	"food/tasks"
 )
 
-type Config struct {
-	Cookie string
-	BarkId string
-	Uid    string
-}
-
+// 捡漏用
 var (
-	cartSleepTime    = time.Millisecond * 5000
-	orderSleepTime   = time.Millisecond * 5000
-	reserveSleepTime = time.Millisecond * 5000
+	cartSleepTime    = time.Millisecond * 3000
+	orderSleepTime   = time.Millisecond * 3000
+	reserveSleepTime = time.Millisecond * 3000
+	refreshSleepTime = time.Millisecond * 5000
 )
 
-var refreshSleepTime = time.Millisecond * 5000
+//  抢购用
+// var (
+// 	cartSleepTime    = time.Millisecond * 100
+// 	orderSleepTime   = time.Millisecond * 100
+// 	reserveSleepTime = time.Millisecond * 100
+//  refreshSleepTime = time.Millisecond * 2000
+// )
 
-var app *tasks.Task
-var session dd.DingdongSession
+var (
+	app             *tasks.Task
+	session         dd.DingdongSession
+	reserveTimeList []dd.ReserveTime
+)
 
-var reserveTimeList []dd.ReserveTime
+var (
+	conf     config.Conf
+	confName string
+)
 
+func init() {
+	flag.StringVar(&confName, "conf", "", "")
+}
+
+func main() {
+	logger.Init()
+
+	flag.Parse()
+
+	if confName == "" {
+		logger.Log.Error("conf name is empty")
+		return
+	}
+	if _, err := conf.GetConf(confName); err != nil {
+		logger.Log.Error(err)
+		return
+	}
+
+	app = tasks.NewTask(context.Background())
+
+	session = dd.DingdongSession{}
+
+	if err := session.InitSession(dd.CommonHeader{
+		Cookie:   conf.Cookie,
+		Uid:      conf.Uid,
+		DeviceId: conf.DeviceId,
+
+		Longitude: conf.Longitude,
+		Latitude:  conf.Latitude,
+	}, conf.BarkId); err != nil {
+		logger.Log.Error(err)
+		return
+	}
+	start()
+}
+
+func start() {
+	var task *tasks.Task
+	var cartHash string
+	cartTime := time.Now()
+
+	for {
+		select {
+		case <-app.Ctx.Done():
+			logger.Log.Info("抢购完毕，程序退出")
+			return
+		default:
+			if task != nil && time.Since(cartTime) < refreshSleepTime {
+				time.Sleep(time.Millisecond * 50)
+				continue
+			}
+			cartTime = time.Now()
+			if err := session.CheckCart(); err != nil {
+				logger.Log.Warnf("获取购物车失败 %s", err)
+				time.Sleep(cartSleepTime)
+				continue
+			}
+
+			if len(session.Cart.ProdList) == 0 {
+				logger.Log.Error("购物车中无有效商品，请先前往app添加或勾选！")
+				app.Cancel()
+				return
+			}
+			session.Order.Products = session.Cart.ProdList
+			hash, _ := json.Marshal(session.Cart)
+			// 直接字符串比较吧，懒得hash了
+			if string(hash) != cartHash {
+				if task != nil {
+					task.Cancel()
+				}
+				if cartHash != "" {
+					logger.Log.Info("--- 购物车发生变化,执行新的任务 ---")
+				}
+				for index, prod := range session.Cart.ProdList {
+					logger.Log.Infof("[%v] %s 数量：%v 总价：%s", index, prod.ProductName, prod.Count, prod.TotalPrice)
+				}
+
+				cartHash = string(hash)
+				task = tasks.NewTask(context.TODO())
+
+				go getReserveTime(task)
+				go createOrder(task)
+			}
+
+		}
+
+	}
+}
 func getReserveTime(task *tasks.Task) {
-
 	for {
 		select {
 		case <-task.Ctx.Done():
 			return
 		default:
-			logger.Log.Infof("获取可预约时间\n", time.Now().Format("15:04:05"))
+			logger.Log.Info("获取可预约时间")
 			err, list := session.GetMultiReserveTime()
 			if err != nil {
-				logger.Log.Warnf("获取预约时间失败")
+				logger.Log.Warnf("获取预约时间失败 %s", err)
 				time.Sleep(reserveSleepTime)
 			} else {
 				reserveTimeList = list
@@ -67,11 +163,11 @@ func createOrder(task *tasks.Task) {
 				logger.Log.Infof("获取订单金额中...")
 				err := session.CheckOrder()
 				if err != nil {
-					fmt.Println(err)
+					logger.Log.Warnf("获取订单金额失败 %s", err)
 					time.Sleep(orderSleepTime)
 					continue
 				}
-				logger.Log.Infof("订单总金额：%v\n", session.Order.Price)
+				logger.Log.Infof("订单总金额：%v", session.Order.Price)
 				checkOrderSuccess = true
 				session.GeneratePackageOrder()
 			}
@@ -81,6 +177,7 @@ func createOrder(task *tasks.Task) {
 			if len(reserveTimeList) > 0 {
 				createTask := tasks.NewTask(context.TODO())
 				createSuccess := false
+				hasProdErr := false
 				go func() {
 					wg := sync.WaitGroup{}
 					for _, reserveTime := range reserveTimeList {
@@ -90,7 +187,7 @@ func createOrder(task *tasks.Task) {
 							case <-createTask.Ctx.Done():
 								wg.Done()
 							default:
-								logger.Log.Infof("提交订单中 预约时间 %s\n", reserveTime.SelectMsg)
+								logger.Log.Infof("提交订单中 预约时间 %s", reserveTime.SelectMsg)
 								s.UpdatePackageOrder(reserveTime)
 								err := s.AddNewOrder()
 								switch err {
@@ -98,11 +195,12 @@ func createOrder(task *tasks.Task) {
 									createTask.Cancel()
 									createSuccess = true
 								case dd.TimeExpireErr:
-									logger.Log.Warnf("%s 预约时间%s \n", err, reserveTime.SelectMsg)
+									hasProdErr = true
+									logger.Log.Warnf("下单失败 预约时间%s %s", reserveTime.SelectMsg, err)
 								case dd.ProdInfoErr:
-									logger.Log.Warn(err)
+									logger.Log.Warnf("下单失败 预约时间%s %s", reserveTime.SelectMsg, err)
 								default:
-									logger.Log.Warn(err)
+									logger.Log.Warnf("下单失败 预约时间%s %s", reserveTime.SelectMsg, err)
 								}
 								wg.Done()
 							}
@@ -112,90 +210,25 @@ func createOrder(task *tasks.Task) {
 					wg.Wait()
 					createTask.Cancel()
 				}()
+
 				<-createTask.Ctx.Done()
+
 				if createSuccess {
 					logger.Log.Infof("抢购成功，请前往app付款！")
 					task.Cancel()
 					app.Cancel()
+					return
+				}
+
+				if hasProdErr {
+					task.Cancel()
+					return
 				}
 
 				time.Sleep(orderSleepTime)
+
 			}
 
 		}
 	}
-}
-
-func start() {
-	var task *tasks.Task
-	var cartHash string
-	for {
-		select {
-		case <-app.Ctx.Done():
-			fmt.Println("抢购完毕，程序退出")
-			return
-		default:
-
-			if err := session.CheckCart(); err != nil {
-				fmt.Println(err)
-				time.Sleep(cartSleepTime)
-				continue
-			}
-
-			if len(session.Cart.ProdList) == 0 {
-				fmt.Println("购物车中无有效商品，请先前往app添加或勾选！")
-				app.Cancel()
-				return
-			}
-			session.Order.Products = session.Cart.ProdList
-			hash, _ := json.Marshal(session.Cart)
-			// 直接字符串比较吧，懒得hash了
-			if string(hash) != cartHash {
-				if task != nil {
-					task.Cancel()
-				}
-				if cartHash != "" {
-					fmt.Println("--- 购物车发生变化,执行新的任务 ---")
-				}
-				for index, prod := range session.Cart.ProdList {
-					fmt.Printf("[%v] %s 数量：%v 总价：%s\n", index, prod.ProductName, prod.Count, prod.TotalPrice)
-				}
-
-				cartHash = string(hash)
-				task = tasks.NewTask(context.TODO())
-
-				go getReserveTime(task)
-				go createOrder(task)
-			}
-			time.Sleep(refreshSleepTime)
-		}
-
-	}
-}
-
-func main() {
-	logger.Init()
-
-	app = tasks.NewTask(context.Background())
-
-	session = dd.DingdongSession{}
-
-    // 配置这里
-	header := dd.CommonHeader{
-		Cookie:    "",
-		Uid:       "",
-		DeviceId:  "",
-
-        // 这两个可以不配置
-		Longitude: "",
-		Latitude:  "",
-	}
-
-	barkId := ""
-
-	if err := session.InitSession(header, barkId); err != nil {
-		fmt.Println(err)
-		return
-	}
-	start()
 }

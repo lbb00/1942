@@ -135,10 +135,10 @@ func (s *DingdongSession) CheckOrder() error {
 		case -3100:
 			return DataLoadErr
 		default:
-			return errors.New(string(body))
+			return fmt.Errorf("[%v] %s", resp.StatusCode, string(body))
 		}
 	} else {
-		return errors.New(fmt.Sprintf("[%v] %s", resp.StatusCode, body))
+		return errors.New(string(body))
 	}
 }
 
@@ -251,9 +251,9 @@ func (s *DingdongSession) AddNewOrder() error {
 			fmt.Println(result.Msg)
 			return TimeExpireErr
 		default:
-			return errors.New(string(body))
+			return fmt.Errorf("[%v] %v,%s", resp.StatusCode, result.Code, result.Msg)
 		}
 	} else {
-		return errors.New(fmt.Sprintf("[%v] %s", resp.StatusCode, body))
+		return errors.New(string(body))
 	}
 }

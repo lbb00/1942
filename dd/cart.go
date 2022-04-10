@@ -21,7 +21,7 @@ type Product struct {
 	TotalOriginPrice string                   `json:"total_origin_money"`
 }
 
-func parseProduct(productMap gjson.Result) (error, Product) {
+func parseProduct(productMap gjson.Result) Product {
 	var sizes []map[string]interface{}
 	for _, size := range productMap.Get("sizes").Array() {
 		sizes = append(sizes, size.Value().(map[string]interface{}))
@@ -35,7 +35,7 @@ func parseProduct(productMap gjson.Result) (error, Product) {
 		OriginPrice: productMap.Get("origin_price").Str,
 		Sizes:       sizes,
 	}
-	return nil, product
+	return product
 }
 
 type Cart struct {
@@ -48,7 +48,7 @@ func (s *DingdongSession) GetEffProd(result gjson.Result) error {
 	effective := result.Get("data.product.effective").Array()
 	for _, effProductMap := range effective {
 		for _, productMap := range effProductMap.Get("products").Array() {
-			_, product := parseProduct(productMap)
+			product := parseProduct(productMap)
 			effProducts = append(effProducts, product)
 		}
 	}
@@ -64,7 +64,7 @@ func (s *DingdongSession) GetCheckProd(result gjson.Result) error {
 	orderProductList := result.Get("data.new_order_product_list").Array()
 	for _, productList := range orderProductList {
 		for _, productMap := range productList.Get("products").Array() {
-			_, product := parseProduct(productMap)
+			product := parseProduct(productMap)
 			products = append(products, product)
 		}
 	}
@@ -126,6 +126,6 @@ func (s *DingdongSession) CheckCart() error {
 			return errors.New(string(body))
 		}
 	} else {
-		return errors.New(fmt.Sprintf("[%v] %s", resp.StatusCode, body))
+		return fmt.Errorf("[%v] %s", resp.StatusCode, body)
 	}
 }

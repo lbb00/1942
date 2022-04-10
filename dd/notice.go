@@ -1,7 +1,6 @@
 package dd
 
 import (
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -22,6 +21,6 @@ func (s *DingdongSession) PushSuccess() error {
 	if resp.StatusCode == 200 {
 		return nil
 	} else {
-		return errors.New(fmt.Sprintf("[%v] %s", resp.StatusCode, body))
+		return fmt.Errorf("[%v] %s", resp.StatusCode, body)
 	}
 }
